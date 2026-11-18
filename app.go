@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -342,15 +343,24 @@ func errString(v any) string {
 
 type cacheEntry struct {
 	gen     int
+	epoch   int
 	status  int
 	headers OutHeaders
 	body    []byte
 }
 
-// Forge is the HTTP handler: it authenticates nothing itself, it dispatches.
+// Forge is the HTTP handler: it authenticates nothing itself, it dispatches. Every request is
+// serialized on one mutex — the store is Go maps, and a map written while another goroutine reads
+// it is a crash. The reply is written outside the lock.
 type Forge struct {
+	mu    sync.Mutex
 	store *Store
 	cache map[string]*cacheEntry
+	// epoch counts every request the cache may not answer (a write or an unknown route), so a
+	// reply that depends on state a mutation changed is never served again.
+	epoch int
+	// lastReply is the reply dispatchLocked built; the caller writes it outside the lock.
+	lastReply *ReplyOut
 }
 
 func newForge(store *Store) *Forge {
@@ -372,19 +382,59 @@ func (f *Forge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		path = target[:i]
 		query = target[i+1:]
 	}
-	raw := readBody(r)
-	queryValues := parseQuery(query)
 
-	canCache := r.Method == "GET" || r.Method == "HEAD" || (r.Method == "POST" && strings.HasSuffix(path, "/git-upload-pack"))
-	var key string
+	canCache := r.Method == "GET" || r.Method == "HEAD" ||
+		(r.Method == "POST" && strings.HasSuffix(path, "/git-upload-pack"))
+	key := ""
 	if canCache {
-		key = r.Method + "\x00" + target + "\x00" + r.Header.Get("Authorization") + "\x00" + r.Header.Get("Git-Protocol") + "\x00" + string(raw)
-		if entry, ok := f.cache[key]; ok && entry.gen == f.store.Writes {
-			writeReply(w, r, entry.status, entry.headers, entry.body, NextRequestID())
-			return
-		}
+		key = r.Method + "\x00" + target + "\x00" + r.Header.Get("Authorization") + "\x00" +
+			r.Header.Get("Git-Protocol") + "\x00"
 	}
 
+	status := 500
+	var headers OutHeaders
+	var body []byte
+	requestID := NextRequestID()
+
+	func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if !canCache {
+			// A request the cache may not answer (a write, an unknown route) retires every
+			// reply kept before it: a state a handler changed is never served stale.
+			f.epoch++
+		}
+		if canCache {
+			full := key
+			if entry, ok := f.cache[full]; ok && entry.gen == f.store.Writes && entry.epoch == f.epoch {
+				status, headers, body = entry.status, entry.headers, entry.body
+				return
+			}
+			raw := readBody(r)
+			if len(raw) > 0 {
+				full = key + string(raw)
+				if entry, ok := f.cache[full]; ok && entry.gen == f.store.Writes && entry.epoch == f.epoch {
+					status, headers, body = entry.status, entry.headers, entry.body
+					return
+				}
+			}
+			f.dispatchLocked(w, r, target, path, query, raw, key, full)
+			reply := f.lastReply
+			status, headers, body = reply.Status, reply.Headers, reply.Body
+			return
+		}
+		raw := readBody(r)
+		f.dispatchLocked(w, r, target, path, query, raw, "", "")
+		reply := f.lastReply
+		status, headers, body = reply.Status, reply.Headers, reply.Body
+	}()
+
+	writeReply(w, r, status, headers, body, requestID)
+}
+
+// dispatchLocked runs one request against the store and remembers the reply for the caller.
+func (f *Forge) dispatchLocked(w http.ResponseWriter, r *http.Request, target, path, query string, raw []byte, key, fullKey string) {
+	queryValues := parseQuery(query)
 	ctx := &Ctx{
 		Host:      r.Host,
 		Proto:     protoOf(r.Header),
@@ -405,19 +455,24 @@ func (f *Forge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx.QueryAll = func(name string) []string { return queryValues[name] }
 
 	gen := f.store.Writes
+	epoch := f.epoch
 	dispatch(ctx)
 
 	reply := ctx.Reply
 	if reply == nil {
-		reply = &ReplyOut{Status: 500, Headers: OutHeaders{"content-type": "application/json; charset=utf-8"}, Body: []byte(`{"message":"internal error"}`)}
+		reply = &ReplyOut{
+			Status:  500,
+			Headers: OutHeaders{"content-type": "application/json; charset=utf-8"},
+			Body:    []byte(`{"message":"internal error"}`),
+		}
 	}
-	if canCache && reply.Status >= 200 && reply.Status < 400 && f.store.Writes == gen {
-		if len(f.cache) > 512 {
+	if key != "" && reply.Status >= 200 && reply.Status < 400 && f.store.Writes == gen && f.epoch == epoch {
+		if len(f.cache) > 2048 {
 			f.cache = make(map[string]*cacheEntry, 512)
 		}
-		f.cache[key] = &cacheEntry{gen: gen, status: reply.Status, headers: reply.Headers, body: reply.Body}
+		f.cache[fullKey] = &cacheEntry{gen: gen, epoch: epoch, status: reply.Status, headers: reply.Headers, body: reply.Body}
 	}
-	writeReply(w, r, reply.Status, reply.Headers, reply.Body, ctx.RequestID)
+	f.lastReply = reply
 }
 
 func writeReply(w http.ResponseWriter, r *http.Request, status int, headers OutHeaders, body []byte, requestID string) {
