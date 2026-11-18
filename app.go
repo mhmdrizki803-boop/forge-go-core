@@ -359,7 +359,12 @@ type Forge struct {
 	// epoch counts every request the cache may not answer (a write or an unknown route), so a
 	// reply that depends on state a mutation changed is never served again.
 	epoch int
+	// cacheBytes bounds the kept replies: a trial may not grow the heap without end.
+	cacheBytes int
 }
+
+// cacheByteBudget is the most a kept reply set may hold before it is dropped whole.
+const cacheByteBudget = 64 << 20
 
 func newForge(store *Store) *Forge {
 	return &Forge{store: store, cache: make(map[string]*cacheEntry, 512)}
@@ -413,6 +418,9 @@ func (f *Forge) cachedReply(key string) (int, OutHeaders, []byte, bool) {
 // serveUncached runs one request the cache could not answer, under the store's write lock.
 func (f *Forge) serveUncached(w http.ResponseWriter, r *http.Request, target, path, query, key string) (int, OutHeaders, []byte, string) {
 	requestID := NextRequestID()
+	// The body is read before the store's lock is taken: a slow client must never hold up the
+	// readers waiting behind it.
+	raw := readBody(r)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if key == "" {
@@ -420,7 +428,6 @@ func (f *Forge) serveUncached(w http.ResponseWriter, r *http.Request, target, pa
 		// before it: state a handler changed is never served stale.
 		f.epoch++
 	}
-	raw := readBody(r)
 	fullKey := ""
 	if key != "" {
 		fullKey = key + string(raw)
@@ -462,8 +469,10 @@ func (f *Forge) serveUncached(w http.ResponseWriter, r *http.Request, target, pa
 		}
 	}
 	if key != "" && reply.Status >= 200 && reply.Status < 400 && f.store.Writes == gen && f.epoch == epoch {
-		if len(f.cache) > 4096 {
+		f.cacheBytes += len(reply.Body) + 128
+		if len(f.cache) > 4096 || f.cacheBytes > cacheByteBudget {
 			f.cache = make(map[string]*cacheEntry, 512)
+			f.cacheBytes = 0
 		}
 		f.cache[fullKey] = &cacheEntry{gen: gen, epoch: epoch, status: reply.Status, headers: reply.Headers, body: reply.Body}
 	}
