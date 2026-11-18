@@ -8,10 +8,8 @@ package main
 import (
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"strconv"
-	"time"
 )
 
 func main() {
@@ -33,12 +31,9 @@ func main() {
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 
-	server := &http.Server{
-		Handler:           newForge(store),
-		ReadHeaderTimeout: 30 * time.Second,
-	}
+	server := newFastServer(newForge(store))
 	go func() {
-		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+		if err := server.serve(listener); err != nil {
 			fmt.Fprintf(os.Stderr, "[forge] serve stopped: %v\n", err)
 		}
 	}()
