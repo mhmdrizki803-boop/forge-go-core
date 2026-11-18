@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const child = spawn(join(here, 'forge'), [], {
   stdio: 'inherit',
-  env: { ...process.env, GOMAXPROCS: '2', GOGC: '300', GOMEMLIMIT: '768MiB' },
+  env: { ...process.env, GOMAXPROCS: '2', GOGC: 'off', GOMEMLIMIT: '768MiB' },
 });
 
 child.on('exit', (code, signal) => process.exit(signal ? 1 : (code ?? 0)));
