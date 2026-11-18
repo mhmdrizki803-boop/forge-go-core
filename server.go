@@ -30,12 +30,16 @@ const (
 	maxRequestBody  = 256 << 20
 )
 
-// fastServer serves a handler on a listener until the listener is closed.
+// fastServer serves a handler on a listener until the listener is closed. When forge is set, a
+// GET or HEAD that the reply cache already holds is answered without building a request at all.
 type fastServer struct {
 	handler http.Handler
+	forge   *Forge
 }
 
 func newFastServer(handler http.Handler) *fastServer { return &fastServer{handler: handler} }
+
+func newForgeServer(forge *Forge) *fastServer { return &fastServer{handler: forge, forge: forge} }
 
 func (s *fastServer) serve(ln net.Listener) error {
 	for {
@@ -55,11 +59,28 @@ func (s *fastServer) handleConn(conn net.Conn) {
 	br := bufio.NewReaderSize(conn, fastReadBuffer)
 	bw := bufio.NewWriterSize(conn, fastWriteBuffer)
 	scratch := make([]byte, 0, 512)
+	var headers fastHeaders
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(fastIdleTimeout))
-		req, err := readFastRequest(conn, br, &scratch)
+		req, raw, err := readFastRequest(conn, br, &scratch, &headers)
 		if err != nil {
 			return
+		}
+		fastRaw := ""
+		if req.Method == "POST" && len(raw) > 0 && strings.HasSuffix(req.RequestURI, "/git-upload-pack") {
+			fastRaw = string(raw)
+		}
+		if s.forge != nil && (req.Method == "GET" || req.Method == "HEAD" || fastRaw != "") {
+			head, body, ok := s.forge.FastWire(req.Method, req.RequestURI, headers.auth, headers.gitProtocol, fastRaw)
+			if ok {
+				if err := writeCachedReply(conn, bw, req, head, body); err != nil {
+					return
+				}
+				if req.Close {
+					return
+				}
+				continue
+			}
 		}
 		writer := &fastWriter{}
 		s.handler.ServeHTTP(writer, req)
@@ -89,24 +110,44 @@ func (r *pReader) Read(p []byte) (int, error) {
 
 func (r *pReader) Close() error { return nil }
 
+// fastHeaders holds the two request headers the reply cache keys on, read without allocating a map.
+type fastHeaders struct {
+	auth        string
+	gitProtocol string
+}
+
+// writeCachedReply writes a prebuilt reply: one buffered pass, no formatting.
+func writeCachedReply(conn net.Conn, bw *bufio.Writer, req *http.Request, head, body []byte) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(fastIdleTimeout))
+	bw.Write(head)
+	bw.WriteString("Date: ")
+	bw.WriteString(time.Now().UTC().Format(http.TimeFormat))
+	bw.WriteString("\r\n\r\n")
+	if req.Method != "HEAD" && len(body) > 0 {
+		bw.Write(body)
+	}
+	return bw.Flush()
+}
+
 // readFastRequest parses one request off the connection. It returns io.EOF when the peer closed.
-func readFastRequest(conn net.Conn, br *bufio.Reader, scratch *[]byte) (*http.Request, error) {
+func readFastRequest(conn net.Conn, br *bufio.Reader, scratch *[]byte, fast *fastHeaders) (*http.Request, []byte, error) {
 	line, err := readCRLFLine(br, scratch)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(line) == 0 {
 		// A stray blank line before a request: skip it, as net/http does.
 		line, err = readCRLFLine(br, scratch)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	method, target, proto, ok := splitRequestLine(line)
 	if !ok {
-		return nil, errors.New("malformed request line")
+		return nil, nil, errors.New("malformed request line")
 	}
 
+	fast.auth, fast.gitProtocol = "", ""
 	header := make(http.Header, 16)
 	var contentLength int64 = -1
 	chunked := false
@@ -115,7 +156,7 @@ func readFastRequest(conn net.Conn, br *bufio.Reader, scratch *[]byte) (*http.Re
 	for {
 		hline, err := readCRLFLine(br, scratch)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(hline) == 0 {
 			break
@@ -146,6 +187,10 @@ func readFastRequest(conn net.Conn, br *bufio.Reader, scratch *[]byte) (*http.Re
 			if strings.Contains(strings.ToLower(value), "100-continue") {
 				wantContinue = true
 			}
+		case "Authorization":
+			fast.auth = value
+		case "Git-Protocol":
+			fast.gitProtocol = value
 		}
 		header[name] = append(header[name], value)
 	}
@@ -157,19 +202,19 @@ func readFastRequest(conn net.Conn, br *bufio.Reader, scratch *[]byte) (*http.Re
 		}
 		body, err = readChunkedBody(br)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		contentLength = int64(len(body))
 	} else if contentLength > 0 {
 		if contentLength > maxRequestBody {
-			return nil, errors.New("request body too large")
+			return nil, nil, errors.New("request body too large")
 		}
 		if wantContinue {
 			_, _ = conn.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
 		}
 		body = make([]byte, contentLength)
 		if _, err := io.ReadFull(br, body); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	} else if contentLength == 0 {
 		body = nil
@@ -193,7 +238,7 @@ func readFastRequest(conn net.Conn, br *bufio.Reader, scratch *[]byte) (*http.Re
 		RemoteAddr:    conn.RemoteAddr().String(),
 		Close:         closeConn,
 	}
-	return req, nil
+	return req, body, nil
 }
 
 func protoMajor(proto string) int {

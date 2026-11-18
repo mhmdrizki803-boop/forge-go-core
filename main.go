@@ -31,7 +31,7 @@ func main() {
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 
-	server := newFastServer(newForge(store))
+	server := newForgeServer(newForge(store))
 	go func() {
 		if err := server.serve(listener); err != nil {
 			fmt.Fprintf(os.Stderr, "[forge] serve stopped: %v\n", err)

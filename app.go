@@ -347,6 +347,9 @@ type cacheEntry struct {
 	status  int
 	headers OutHeaders
 	body    []byte
+	// head is the reply's status line and headers, prebuilt so a cache hit can be written with
+	// one call into the connection's buffer and no per-request formatting at all.
+	head []byte
 }
 
 // Forge is the HTTP handler: it authenticates nothing itself, it dispatches. Every request is
@@ -474,9 +477,57 @@ func (f *Forge) serveUncached(w http.ResponseWriter, r *http.Request, target, pa
 			f.cache = make(map[string]*cacheEntry, 512)
 			f.cacheBytes = 0
 		}
-		f.cache[fullKey] = &cacheEntry{gen: gen, epoch: epoch, status: reply.Status, headers: reply.Headers, body: reply.Body}
+		f.cache[fullKey] = &cacheEntry{gen: gen, epoch: epoch, status: reply.Status, headers: reply.Headers, body: reply.Body,
+			head: buildReplyHead(reply.Status, reply.Headers, len(reply.Body))}
 	}
 	return reply.Status, reply.Headers, reply.Body, requestID
+}
+
+// buildReplyHead renders one reply's status line and headers once, for the cache's fast path.
+func buildReplyHead(status int, headers OutHeaders, bodyLen int) []byte {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, "HTTP/1.1 "...)
+	buf = strconv.AppendInt(buf, int64(status), 10)
+	buf = append(buf, ' ')
+	buf = append(buf, httpStatusText(status)...)
+	buf = append(buf, '\r', '\n')
+	for k, v := range headers {
+		if k == "content-length" || k == "Content-Length" {
+			continue
+		}
+		buf = append(buf, k...)
+		buf = append(buf, ':', ' ')
+		buf = append(buf, v...)
+		buf = append(buf, '\r', '\n')
+	}
+	if status != 204 && status != 304 {
+		buf = append(buf, "Content-Length: "...)
+		buf = strconv.AppendInt(buf, int64(bodyLen), 10)
+		buf = append(buf, '\r', '\n')
+	}
+	return buf
+}
+
+func httpStatusText(status int) string {
+	if text := http.StatusText(status); text != "" {
+		return text
+	}
+	return "Status"
+}
+
+// FastWire answers a GET or HEAD from the reply cache without building an http.Request,
+// a header map or a response writer. It is the hot path of the trial's read workload.
+func (f *Forge) FastWire(method, target, auth, gitProtocol, raw string) (head, body []byte, ok bool) {
+	key := method + "\x00" + target + "\x00" + auth + "\x00" + gitProtocol + "\x00" + raw
+	f.mu.RLock()
+	entry, found := f.cache[key]
+	if !found || entry.gen != f.store.Writes || entry.epoch != f.epoch {
+		f.mu.RUnlock()
+		return nil, nil, false
+	}
+	head, body = entry.head, entry.body
+	f.mu.RUnlock()
+	return head, body, true
 }
 
 func writeReply(w http.ResponseWriter, r *http.Request, status int, headers OutHeaders, body []byte, requestID string) {
