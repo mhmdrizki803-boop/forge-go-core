@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -85,7 +86,7 @@ var (
 	repos   = map[string]*Repo{}
 	order   []*Repo
 	repoSeq int
-	reqSeq  int
+	reqSeq  int64
 )
 
 func key(owner, name string) string { return owner + "/" + name }
@@ -102,11 +103,7 @@ func blobSha(content string) string {
 }
 
 func newReqID() string {
-	mu.Lock()
-	reqSeq++
-	n := reqSeq
-	mu.Unlock()
-	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), n)
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), atomic.AddInt64(&reqSeq, 1))
 }
 
 func writeJSON(w http.ResponseWriter, status int, body interface{}) {
@@ -346,12 +343,12 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 401, "Requires authentication")
 			return
 		}
+		w.Header().Set("X-OAuth-Scopes", "repo, read:org")
 		writeJSON(w, 200, map[string]interface{}{
 			"current_user_url":        "/api/v3/user",
 			"rate_limit_url":          "/api/v3/rate_limit",
 			"repository_url":          "/api/v3/repos/{owner}/{repo}",
 		})
-		w.Header() // header already set inside writeJSON
 		return
 	}
 	if strings.HasPrefix(path, "/api/v3/") {
@@ -1231,23 +1228,26 @@ func (s *server) pullMerge(w http.ResponseWriter, r *http.Request, rp *Repo, num
 	headFiles := rp.snapshotCommit(headTip)
 	baseFiles := rp.snapshotCommit(baseTip)
 
-	conflict := false
-	for path, hc := range headFiles {
-		mc, inMb := mbFiles[path]
-		if !inMb || mc != hc {
-			bc, inBase := baseFiles[path]
-			if !inBase || bc != mc {
-				conflict = true
-				break
-			}
-		}
+	all := map[string]bool{}
+	for k := range mbFiles {
+		all[k] = true
 	}
-	for path, mc := range mbFiles {
-		if _, inHead := headFiles[path]; !inHead {
-			if bc, inBase := baseFiles[path]; !inBase || bc != mc {
-				conflict = true
-				break
-			}
+	for k := range headFiles {
+		all[k] = true
+	}
+	for k := range baseFiles {
+		all[k] = true
+	}
+	conflict := false
+	for path := range all {
+		hc, hasH := headFiles[path]
+		bc, hasB := baseFiles[path]
+		mc, hasM := mbFiles[path]
+		changedH := (hasH != hasM) || (hasH && hasM && hc != mc)
+		changedB := (hasB != hasM) || (hasB && hasM && bc != mc)
+		if changedH && changedB && (!hasH || !hasB || hc != bc) {
+			conflict = true
+			break
 		}
 	}
 	if conflict {
@@ -1259,17 +1259,17 @@ func (s *server) pullMerge(w http.ResponseWriter, r *http.Request, rp *Repo, num
 	for k, v := range baseFiles {
 		merged[k] = v
 	}
-	for path, hc := range headFiles {
-		mc, inMb := mbFiles[path]
-		if !inMb || mc != hc {
-			merged[path] = hc
+	for path := range all {
+		hc, hasH := headFiles[path]
+		mc, hasM := mbFiles[path]
+		changedH := (hasH != hasM) || (hasH && hasM && hc != mc)
+		if !changedH {
+			continue
 		}
-	}
-	for path, mc := range mbFiles {
-		if _, inHead := headFiles[path]; !inHead {
-			if _, inBase := baseFiles[path]; !inBase || baseFiles[path] == mc {
-				delete(merged, path)
-			}
+		if hasH {
+			merged[path] = hc
+		} else {
+			delete(merged, path)
 		}
 	}
 	msg := fmt.Sprintf("Merge pull request #%d from %s", p.Number, p.Head)
