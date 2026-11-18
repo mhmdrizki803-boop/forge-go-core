@@ -5,35 +5,29 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"time"
 )
-
-// newListener binds a TCP listener on addr (":0" picks a free port).
-func newListener(addr string) (net.Listener, error) {
-	return net.Listen("tcp", addr)
-}
-
-type netTCPAddr = net.TCPAddr
 
 // register POSTs {"port":N} to the env until it accepts it.
 func register(envURL string, port int) error {
 	body, _ := json.Marshal(map[string]int{"port": port})
 	client := &http.Client{Timeout: 30 * time.Second}
-	delay := 250 * time.Millisecond
-	for attempt := 0; ; attempt++ {
-		req, _ := http.NewRequest("POST", envURL+"/register", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
+	delay := 100 * time.Millisecond
+	for attempt := 0; attempt < 200; attempt++ {
+		req, err := http.NewRequest("POST", envURL+"/register", bytes.NewReader(body))
 		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == 200 || resp.StatusCode == 409 {
-				return nil
-			}
-			if resp.StatusCode == 400 || resp.StatusCode == 405 {
-				return fmt.Errorf("register answered HTTP %d", resp.StatusCode)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode == 200 || resp.StatusCode == 409 {
+					return nil
+				}
+				if resp.StatusCode == 400 || resp.StatusCode == 405 {
+					return fmt.Errorf("register answered HTTP %d", resp.StatusCode)
+				}
 			}
 		}
 		time.Sleep(delay)
@@ -41,6 +35,7 @@ func register(envURL string, port int) error {
 			delay *= 2
 		}
 	}
+	return fmt.Errorf("register never accepted the port")
 }
 
 // waitForDone polls GET /done until it answers {"done":true}.
