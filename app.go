@@ -353,14 +353,12 @@ type cacheEntry struct {
 // serialized on one mutex — the store is Go maps, and a map written while another goroutine reads
 // it is a crash. The reply is written outside the lock.
 type Forge struct {
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	store *Store
 	cache map[string]*cacheEntry
 	// epoch counts every request the cache may not answer (a write or an unknown route), so a
 	// reply that depends on state a mutation changed is never served again.
 	epoch int
-	// lastReply is the reply dispatchLocked built; the caller writes it outside the lock.
-	lastReply *ReplyOut
 }
 
 func newForge(store *Store) *Forge {
@@ -389,62 +387,59 @@ func (f *Forge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if canCache {
 		key = r.Method + "\x00" + target + "\x00" + r.Header.Get("Authorization") + "\x00" +
 			r.Header.Get("Git-Protocol") + "\x00"
-	}
-
-	status := 500
-	var headers OutHeaders
-	var body []byte
-	requestID := NextRequestID()
-
-	func() {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		if !canCache {
-			// A request the cache may not answer (a write, an unknown route) retires every
-			// reply kept before it: a state a handler changed is never served stale.
-			f.epoch++
-		}
-		if canCache {
-			full := key
-			if entry, ok := f.cache[full]; ok && entry.gen == f.store.Writes && entry.epoch == f.epoch {
-				status, headers, body = entry.status, entry.headers, entry.body
-				return
-			}
-			raw := readBody(r)
-			if len(raw) > 0 {
-				full = key + string(raw)
-				if entry, ok := f.cache[full]; ok && entry.gen == f.store.Writes && entry.epoch == f.epoch {
-					status, headers, body = entry.status, entry.headers, entry.body
-					return
-				}
-			}
-			f.dispatchLocked(w, r, target, path, query, raw, key, full)
-			reply := f.lastReply
-			status, headers, body = reply.Status, reply.Headers, reply.Body
+		// A reply kept for this request answers it without touching the store: a reader never
+		// queues behind another reader, so fifty concurrent clones cost one pack between them.
+		if status, headers, body, ok := f.cachedReply(key); ok {
+			writeReply(w, r, status, headers, body, NextRequestID())
 			return
 		}
-		raw := readBody(r)
-		f.dispatchLocked(w, r, target, path, query, raw, "", "")
-		reply := f.lastReply
-		status, headers, body = reply.Status, reply.Headers, reply.Body
-	}()
-
+	}
+	status, headers, body, requestID := f.serveUncached(w, r, target, path, query, key)
 	writeReply(w, r, status, headers, body, requestID)
 }
 
-// dispatchLocked runs one request against the store and remembers the reply for the caller.
-func (f *Forge) dispatchLocked(w http.ResponseWriter, r *http.Request, target, path, query string, raw []byte, key, fullKey string) {
+// cachedReply answers a request from the cache when a reply kept for it is still current. The
+// read lock is what keeps it honest: every mutation runs under the write lock.
+func (f *Forge) cachedReply(key string) (int, OutHeaders, []byte, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	entry, ok := f.cache[key]
+	if !ok || entry.gen != f.store.Writes || entry.epoch != f.epoch {
+		return 0, nil, nil, false
+	}
+	return entry.status, entry.headers, entry.body, true
+}
+
+// serveUncached runs one request the cache could not answer, under the store's write lock.
+func (f *Forge) serveUncached(w http.ResponseWriter, r *http.Request, target, path, query, key string) (int, OutHeaders, []byte, string) {
+	requestID := NextRequestID()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if key == "" {
+		// A request the cache may not answer (a write, an unknown route) retires every reply kept
+		// before it: state a handler changed is never served stale.
+		f.epoch++
+	}
+	raw := readBody(r)
+	fullKey := ""
+	if key != "" {
+		fullKey = key + string(raw)
+		if entry, ok := f.cache[fullKey]; ok && entry.gen == f.store.Writes && entry.epoch == f.epoch {
+			return entry.status, entry.headers, entry.body, requestID
+		}
+	}
+
 	queryValues := parseQuery(query)
 	ctx := &Ctx{
 		Host:      r.Host,
 		Proto:     protoOf(r.Header),
-		Method:    strings.ToUpper(r.Method),
+		Method:    r.Method,
 		Path:      path,
 		Params:    map[string]string{},
 		Headers:   r.Header,
 		Raw:       raw,
 		Store:     f.store,
-		RequestID: NextRequestID(),
+		RequestID: requestID,
 	}
 	ctx.QueryGet = func(name string) string {
 		if v, ok := queryValues[name]; ok && len(v) > 0 {
@@ -467,12 +462,12 @@ func (f *Forge) dispatchLocked(w http.ResponseWriter, r *http.Request, target, p
 		}
 	}
 	if key != "" && reply.Status >= 200 && reply.Status < 400 && f.store.Writes == gen && f.epoch == epoch {
-		if len(f.cache) > 2048 {
+		if len(f.cache) > 4096 {
 			f.cache = make(map[string]*cacheEntry, 512)
 		}
 		f.cache[fullKey] = &cacheEntry{gen: gen, epoch: epoch, status: reply.Status, headers: reply.Headers, body: reply.Body}
 	}
-	f.lastReply = reply
+	return reply.Status, reply.Headers, reply.Body, requestID
 }
 
 func writeReply(w http.ResponseWriter, r *http.Request, status int, headers OutHeaders, body []byte, requestID string) {
